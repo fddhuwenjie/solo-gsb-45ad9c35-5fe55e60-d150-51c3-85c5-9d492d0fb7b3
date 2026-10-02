@@ -1,0 +1,11 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - lineage-data:/srv/app/data
+    restart: unless-stopped
+
+volumes:
+  lineage-data:

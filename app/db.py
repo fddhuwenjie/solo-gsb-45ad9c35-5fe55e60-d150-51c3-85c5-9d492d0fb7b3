@@ -169,6 +169,60 @@ CREATE TABLE IF NOT EXISTS reservation_cancellations (
     request_key    TEXT NOT NULL UNIQUE,
     cancelled_at   TEXT NOT NULL
 );
+
+-- 移液计划（先核对、后确认）：调用方以 request_key 提交 operations（可选
+-- reservation_id）创建计划，服务在事务内固定涉及孔的规范快照并逐步校验，
+-- 只写计划记录——不落批次、不动液体；预演失败不落计划、不消耗 request_key。
+-- 随后用独立 confirm_key 确认：同一写事务重读状态，快照各项均未变化才按原
+-- 顺序原子执行（生成正式批次）并把计划标记 committed；任一变化 409 可重试。
+-- status: planned（已核对待确认）/ committed（已确认执行，计划即失效）
+CREATE TABLE IF NOT EXISTS plans (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_key  TEXT NOT NULL UNIQUE,
+    status       TEXT NOT NULL CHECK (status IN ('planned', 'committed')),
+    reservation_id INTEGER REFERENCES reservations(id),
+    -- 确认键：提交时写入并作为所生成批次的 request_key；NULL 表示尚未确认
+    confirm_key  TEXT UNIQUE,
+    committed_batch_id INTEGER REFERENCES batches(id),
+    created_at   TEXT NOT NULL,
+    committed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS plan_operations (
+    plan_id     INTEGER NOT NULL REFERENCES plans(id),
+    step        INTEGER NOT NULL,
+    source      TEXT NOT NULL,
+    destination TEXT NOT NULL,
+    volume      TEXT NOT NULL,
+    PRIMARY KEY (plan_id, step)
+);
+
+-- 计划规范快照：创建计划时涉及孔的体积/容量/隔离；volume 为 NULL 表示该孔
+-- 在计划时尚未登记（确认时仍须未登记才算未变化）。
+CREATE TABLE IF NOT EXISTS plan_well_snapshots (
+    plan_id     INTEGER NOT NULL REFERENCES plans(id),
+    well        TEXT NOT NULL,
+    volume      TEXT,
+    max_capacity TEXT,
+    quarantine_request_id INTEGER,
+    PRIMARY KEY (plan_id, well)
+);
+
+CREATE TABLE IF NOT EXISTS plan_snapshot_composition (
+    plan_id   INTEGER NOT NULL REFERENCES plans(id),
+    well      TEXT NOT NULL,
+    sample_id INTEGER NOT NULL REFERENCES samples(id),
+    amount    TEXT NOT NULL,
+    PRIMARY KEY (plan_id, well, sample_id)
+);
+
+CREATE TABLE IF NOT EXISTS plan_snapshot_reservations (
+    plan_id        INTEGER NOT NULL REFERENCES plans(id),
+    well           TEXT NOT NULL,
+    reservation_id INTEGER NOT NULL,
+    volume         TEXT NOT NULL,
+    PRIMARY KEY (plan_id, well, reservation_id)
+);
 """
 
 

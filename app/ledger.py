@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
+from types import SimpleNamespace
 
 # 统一量化到小数点后 9 位，避免 1/3 这类无限循环小数在库中无限膨胀。
 QUANTUM = Decimal("0.000000001")
@@ -355,6 +356,38 @@ def _save_pre_batch_snapshot(conn: sqlite3.Connection, batch_id: int, wells: lis
         )
 
 
+def _check_reservation_fulfillment(
+    conn: sqlite3.Connection, reservation_id: int, operations: list
+) -> dict[str, Decimal]:
+    """绑定预留批次的预检：预留必须存在且为 active，且批次从每个预留来源孔
+    吸取的体积之和与预留体积严格相等（预留的每个孔也都必须作为来源出现）。
+    通过时返回该预留的逐孔体积（本批次有权动用的部分）。
+    """
+    res = conn.execute(
+        "SELECT * FROM reservations WHERE id = ?", (reservation_id,)
+    ).fetchone()
+    if res is None:
+        raise ReservationNotFound(reservation_id)
+    if res["status"] != "active":
+        raise ReservationNotActive(reservation_id, res["status"])
+    own_items = {
+        r["well"]: Decimal(r["volume"])
+        for r in conn.execute(
+            "SELECT well, volume FROM reservation_items WHERE reservation_id = ?",
+            (reservation_id,),
+        ).fetchall()
+    }
+    requested_by_well: dict[str, Decimal] = {}
+    for op in operations:
+        requested_by_well[op.source] = requested_by_well.get(op.source, ZERO) + q(
+            op.volume
+        )
+    mismatches = _fulfillment_mismatches(own_items, requested_by_well)
+    if mismatches:
+        raise ReservationFulfillmentMismatch(reservation_id, mismatches)
+    return own_items
+
+
 def execute_batch(
     conn: sqlite3.Connection,
     request_key: str,
@@ -384,28 +417,7 @@ def execute_batch(
 
     own_items: dict[str, Decimal] = {}
     if reservation_id is not None:
-        res = conn.execute(
-            "SELECT * FROM reservations WHERE id = ?", (reservation_id,)
-        ).fetchone()
-        if res is None:
-            raise ReservationNotFound(reservation_id)
-        if res["status"] != "active":
-            raise ReservationNotActive(reservation_id, res["status"])
-        own_items = {
-            r["well"]: Decimal(r["volume"])
-            for r in conn.execute(
-                "SELECT well, volume FROM reservation_items WHERE reservation_id = ?",
-                (reservation_id,),
-            ).fetchall()
-        }
-        requested_by_well: dict[str, Decimal] = {}
-        for op in operations:
-            requested_by_well[op.source] = requested_by_well.get(op.source, ZERO) + q(
-                op.volume
-            )
-        mismatches = _fulfillment_mismatches(own_items, requested_by_well)
-        if mismatches:
-            raise ReservationFulfillmentMismatch(reservation_id, mismatches)
+        own_items = _check_reservation_fulfillment(conn, reservation_id, operations)
 
     # 各来源孔上本批次无权动用的生效预留量：绑定预留时扣除本预留自身占用的
     # 部分（它正是为这个批次预留的）；未绑定时全部生效预留均不可动用。
@@ -1222,4 +1234,589 @@ def cancellation_payload(
         "cancelled_at": row["cancelled_at"],
         "replayed": replayed,
         "reservation": reservation_payload(conn, row["reservation_id"]),
+    }
+
+
+# ---------------------------------------------------------------- 移液计划（先核对、后确认）
+
+
+class PlanNotFound(Exception):
+    """计划编号不存在。"""
+
+    def __init__(self, plan_id: int) -> None:
+        self.plan_id = plan_id
+        super().__init__(f"计划 {plan_id} 不存在")
+
+
+class PlanValidationFailed(Exception):
+    """计划预演（逐步校验）失败：不落计划、不消耗 request_key。"""
+
+    def __init__(self, failure: dict) -> None:
+        self.failure = failure
+        super().__init__(failure["message"])
+
+
+class PlanAlreadyCommitted(Exception):
+    """计划已提交（失效）：不得重复执行、重复扣量。"""
+
+    def __init__(self, plan_id: int, confirm_key: str, committed_batch_id: int) -> None:
+        self.plan_id = plan_id
+        self.confirm_key = confirm_key
+        self.committed_batch_id = committed_batch_id
+        super().__init__(
+            f"计划 {plan_id} 已用 confirm_key {confirm_key} 提交"
+            f"（批次 {committed_batch_id}），不能重复确认"
+        )
+
+
+class PlanConfirmKeyConflict(Exception):
+    """confirm_key 已被其他计划或批次占用（错键冲突）。"""
+
+    def __init__(
+        self,
+        confirm_key: str,
+        existing_plan_id: int | None = None,
+        existing_batch_id: int | None = None,
+    ) -> None:
+        self.confirm_key = confirm_key
+        self.existing_plan_id = existing_plan_id
+        self.existing_batch_id = existing_batch_id
+        if existing_plan_id is not None:
+            message = f"confirm_key {confirm_key} 已用于确认计划 {existing_plan_id}"
+        else:
+            message = f"confirm_key {confirm_key} 已用于提交批次 {existing_batch_id}"
+        super().__init__(message)
+
+
+class PlanStateChanged(Exception):
+    """确认时快照与当前状态不一致：未执行，计划保持 planned 可重试。"""
+
+    def __init__(
+        self,
+        plan_id: int,
+        changed_wells: list[dict],
+        reservation_change: dict | None = None,
+    ) -> None:
+        self.plan_id = plan_id
+        self.changed_wells = changed_wells
+        self.reservation_change = reservation_change
+        parts = []
+        if changed_wells:
+            labels = "、".join(w["well"] for w in changed_wells)
+            parts.append(f"涉及孔状态已变化（{labels}）")
+        if reservation_change is not None:
+            parts.append(
+                f"绑定预留 {reservation_change['reservation_id']} 状态已变为 "
+                f"{reservation_change['current']}"
+            )
+        self.message = f"计划 {plan_id} {'，'.join(parts)}，未执行；计划保持可重试"
+        super().__init__(self.message)
+
+
+def _dec_or_none(value: Decimal | None) -> str | None:
+    return None if value is None else dec_str(value)
+
+
+def _capture_well_snapshot(conn: sqlite3.Connection, wells: list[str]) -> dict[str, dict]:
+    """这些孔的规范快照：体积、组成、容量、生效隔离与生效预留。"""
+    snapshot: dict[str, dict] = {}
+    for well in wells:
+        row = conn.execute(
+            "SELECT volume, max_capacity FROM wells WHERE well = ?", (well,)
+        ).fetchone()
+        exists = row is not None
+        composition: dict[int, Decimal] = {}
+        if exists:
+            composition = {
+                int(r["sample_id"]): Decimal(r["amount"])
+                for r in conn.execute(
+                    "SELECT sample_id, amount FROM well_composition WHERE well = ? "
+                    "ORDER BY sample_id",
+                    (well,),
+                ).fetchall()
+            }
+        quarantine = conn.execute(
+            "SELECT request_id FROM quarantine_wells WHERE well = ? AND released_at IS NULL",
+            (well,),
+        ).fetchone()
+        snapshot[well] = {
+            "exists": exists,
+            "volume": Decimal(row["volume"]) if exists else None,
+            "capacity": (
+                Decimal(row["max_capacity"])
+                if exists and row["max_capacity"] is not None
+                else None
+            ),
+            "composition": composition,
+            "quarantine_request_id": (
+                int(quarantine["request_id"]) if quarantine else None
+            ),
+            "reservations": [
+                {
+                    "reservation_id": int(item["reservation_id"]),
+                    "volume": Decimal(item["volume"]),
+                }
+                for item in active_reservation_items(conn, well)
+            ],
+        }
+    return snapshot
+
+
+def _held_by_others(
+    snapshot: dict[str, dict], own_items: dict[str, Decimal], source_wells: list[str]
+) -> dict[str, Decimal]:
+    """各来源孔上本批次无权动用的生效预留量（绑定预留时扣除本预留自身部分）。"""
+    held: dict[str, Decimal] = {}
+    for well in dict.fromkeys(source_wells):
+        reserved = sum((r["volume"] for r in snapshot[well]["reservations"]), ZERO)
+        others = reserved - own_items.get(well, ZERO)
+        held[well] = others if others > ZERO else ZERO
+    return held
+
+
+def _simulate_steps(
+    snapshot: dict[str, dict],
+    operations: list,
+    held_by_others: dict[str, Decimal],
+) -> tuple[list[dict], dict | None]:
+    """在快照的内存副本上按原顺序预演每一步（与 apply_transfer 同一套分配算法）。
+
+    返回（逐步校验结果, 失败信息或 None）；任一步体积不足或容量超限即停止。
+    快照本身不被修改。
+    """
+    state = {
+        well: {
+            "volume": snap["volume"] if snap["volume"] is not None else ZERO,
+            "capacity": snap["capacity"],
+            "composition": dict(snap["composition"]),
+        }
+        for well, snap in snapshot.items()
+    }
+    steps: list[dict] = []
+    for step, op in enumerate(operations, start=1):
+        volume = q(op.volume)
+        src = state[op.source]
+        dst = state[op.destination]
+        usable = src["volume"] - held_by_others.get(op.source, ZERO)
+        if usable < volume:
+            available = dec_str(usable)
+            requested = dec_str(volume)
+            return steps, {
+                "message": (
+                    f"第 {step} 步：孔位 {op.source} 体积不足："
+                    f"可用 {available}，请求吸取 {requested}"
+                ),
+                "reason": "insufficient_volume",
+                "step": step,
+                "well": op.source,
+                "available": available,
+                "requested": requested,
+            }
+        amounts = sorted(src["composition"].items())
+        move_units = int(volume / QUANTUM)
+        moved_units = _allocate_move(amounts, move_units) if move_units else {}
+        moved_total = ZERO
+        for sample_id, amount in amounts:
+            moved = QUANTUM * moved_units.get(sample_id, 0)
+            moved_total += moved
+            remaining = amount - moved
+            if remaining:
+                src["composition"][sample_id] = remaining
+            else:
+                del src["composition"][sample_id]
+            if moved:
+                dst["composition"][sample_id] = (
+                    dst["composition"].get(sample_id, ZERO) + moved
+                )
+        # 与 apply_transfer 一致：按本步执行时目标孔的当时体积校验上限
+        if dst["capacity"] is not None and dst["volume"] + moved_total > dst["capacity"]:
+            return steps, {
+                "message": (
+                    f"第 {step} 步：孔位 {op.destination} 容量超限：当前体积 "
+                    f"{dec_str(dst['volume'])}，拟加入 {dec_str(moved_total)}，"
+                    f"上限 {dec_str(dst['capacity'])}"
+                ),
+                "reason": "capacity_exceeded",
+                "step": step,
+                "well": op.destination,
+                "volume": dec_str(dst["volume"]),
+                "adding": dec_str(moved_total),
+                "max_capacity": dec_str(dst["capacity"]),
+            }
+        src["volume"] -= moved_total
+        dst["volume"] += moved_total
+        steps.append(
+            {
+                "step": step,
+                "source": op.source,
+                "destination": op.destination,
+                "volume": dec_str(volume),
+                "source_volume_after": dec_str(src["volume"]),
+                "destination_volume_after": dec_str(dst["volume"]),
+            }
+        )
+    return steps, None
+
+
+def _save_plan_snapshot(
+    conn: sqlite3.Connection, plan_id: int, snapshot: dict[str, dict]
+) -> None:
+    """把涉及孔的规范快照随计划落库（与计划同事务）。"""
+    for well, state in snapshot.items():
+        conn.execute(
+            "INSERT INTO plan_well_snapshots "
+            "(plan_id, well, volume, max_capacity, quarantine_request_id) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                plan_id,
+                well,
+                _dec_or_none(state["volume"]),
+                _dec_or_none(state["capacity"]),
+                state["quarantine_request_id"],
+            ),
+        )
+        conn.executemany(
+            "INSERT INTO plan_snapshot_composition (plan_id, well, sample_id, amount) "
+            "VALUES (?, ?, ?, ?)",
+            [
+                (plan_id, well, sample_id, dec_str(amount))
+                for sample_id, amount in state["composition"].items()
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO plan_snapshot_reservations "
+            "(plan_id, well, reservation_id, volume) VALUES (?, ?, ?, ?)",
+            [
+                (plan_id, well, r["reservation_id"], dec_str(r["volume"]))
+                for r in state["reservations"]
+            ],
+        )
+
+
+def _load_plan_snapshot(conn: sqlite3.Connection, plan_id: int) -> dict[str, dict]:
+    """读取计划的规范快照（结构与 _capture_well_snapshot 相同，按孔排序）。"""
+    snapshot: dict[str, dict] = {}
+    rows = conn.execute(
+        "SELECT well, volume, max_capacity, quarantine_request_id "
+        "FROM plan_well_snapshots WHERE plan_id = ? ORDER BY well",
+        (plan_id,),
+    ).fetchall()
+    for row in rows:
+        well = row["well"]
+        composition = {
+            int(r["sample_id"]): Decimal(r["amount"])
+            for r in conn.execute(
+                "SELECT sample_id, amount FROM plan_snapshot_composition "
+                "WHERE plan_id = ? AND well = ? ORDER BY sample_id",
+                (plan_id, well),
+            ).fetchall()
+        }
+        reservations = [
+            {"reservation_id": int(r["reservation_id"]), "volume": Decimal(r["volume"])}
+            for r in conn.execute(
+                "SELECT reservation_id, volume FROM plan_snapshot_reservations "
+                "WHERE plan_id = ? AND well = ? ORDER BY reservation_id",
+                (plan_id, well),
+            ).fetchall()
+        ]
+        snapshot[well] = {
+            "exists": row["volume"] is not None,
+            "volume": Decimal(row["volume"]) if row["volume"] is not None else None,
+            "capacity": (
+                Decimal(row["max_capacity"]) if row["max_capacity"] is not None else None
+            ),
+            "composition": composition,
+            "quarantine_request_id": row["quarantine_request_id"],
+            "reservations": reservations,
+        }
+    return snapshot
+
+
+def apply_plan(
+    conn: sqlite3.Connection,
+    request_key: str,
+    operations: list,
+    reservation_id: int | None = None,
+) -> int:
+    """在调用方事务内固定涉及孔的规范快照、逐步校验并原子写入计划记录。
+
+    只写计划相关表：不落批次、不改变液体。任一校验失败（隔离/预留/逐步体积
+    与容量）即抛出，由调用方回滚——不落计划、不消耗 request_key。
+    """
+    touched_wells = list(
+        dict.fromkeys(well for op in operations for well in (op.source, op.destination))
+    )
+    quarantined = _active_quarantine_map(conn, touched_wells)
+    if quarantined:
+        raise WellQuarantined([quarantined[w] for w in touched_wells if w in quarantined])
+
+    own_items: dict[str, Decimal] = {}
+    if reservation_id is not None:
+        own_items = _check_reservation_fulfillment(conn, reservation_id, operations)
+
+    snapshot = _capture_well_snapshot(conn, touched_wells)
+    held_by_others = _held_by_others(
+        snapshot, own_items, [op.source for op in operations]
+    )
+    steps, failure = _simulate_steps(snapshot, operations, held_by_others)
+    if failure is not None:
+        raise PlanValidationFailed(failure)
+
+    cur = conn.execute(
+        "INSERT INTO plans (request_key, status, reservation_id, created_at) "
+        "VALUES (?, 'planned', ?, ?)",
+        (request_key, reservation_id, _now()),
+    )
+    plan_id = int(cur.lastrowid)
+    conn.executemany(
+        "INSERT INTO plan_operations (plan_id, step, source, destination, volume) "
+        "VALUES (?, ?, ?, ?, ?)",
+        [
+            (plan_id, step, op.source, op.destination, dec_str(q(op.volume)))
+            for step, op in enumerate(operations, start=1)
+        ],
+    )
+    _save_plan_snapshot(conn, plan_id, snapshot)
+    return plan_id
+
+
+def _plan_state_changes(
+    conn: sqlite3.Connection, plan_row: sqlite3.Row
+) -> tuple[list[dict], dict | None]:
+    """逐项比对计划快照与当前状态：返回（逐孔变化列表, 绑定预留变化或 None）。"""
+    plan_id = int(plan_row["id"])
+    planned = _load_plan_snapshot(conn, plan_id)
+    current = _capture_well_snapshot(conn, list(planned))
+    sample_names = {
+        int(r["id"]): r["name"] for r in conn.execute("SELECT id, name FROM samples")
+    }
+
+    def _composition_view(composition: dict[int, Decimal]) -> dict:
+        return {
+            sample_names[sample_id]: dec_str(amount)
+            for sample_id, amount in sorted(
+                composition.items(), key=lambda item: sample_names[item[0]]
+            )
+        }
+
+    def _reservations_view(reservations: list[dict]) -> list[dict]:
+        return [
+            {"reservation_id": r["reservation_id"], "volume": dec_str(r["volume"])}
+            for r in reservations
+        ]
+
+    changed_wells: list[dict] = []
+    for well, before in planned.items():
+        now = current[well]
+        changes: list[dict] = []
+        if before["volume"] != now["volume"]:
+            changes.append(
+                {
+                    "field": "volume",
+                    "planned": _dec_or_none(before["volume"]),
+                    "current": _dec_or_none(now["volume"]),
+                }
+            )
+        if before["composition"] != now["composition"]:
+            changes.append(
+                {
+                    "field": "composition",
+                    "planned": _composition_view(before["composition"]),
+                    "current": _composition_view(now["composition"]),
+                }
+            )
+        if before["capacity"] != now["capacity"]:
+            changes.append(
+                {
+                    "field": "capacity",
+                    "planned": _dec_or_none(before["capacity"]),
+                    "current": _dec_or_none(now["capacity"]),
+                }
+            )
+        if before["quarantine_request_id"] != now["quarantine_request_id"]:
+            changes.append(
+                {
+                    "field": "quarantine",
+                    "planned": before["quarantine_request_id"],
+                    "current": now["quarantine_request_id"],
+                }
+            )
+        if before["reservations"] != now["reservations"]:
+            changes.append(
+                {
+                    "field": "reservations",
+                    "planned": _reservations_view(before["reservations"]),
+                    "current": _reservations_view(now["reservations"]),
+                }
+            )
+        if changes:
+            changed_wells.append({"well": well, "changes": changes})
+
+    reservation_change = None
+    if plan_row["reservation_id"] is not None:
+        res = conn.execute(
+            "SELECT status FROM reservations WHERE id = ?", (plan_row["reservation_id"],)
+        ).fetchone()
+        current_status = res["status"] if res is not None else None
+        if current_status != "active":
+            reservation_change = {
+                "reservation_id": plan_row["reservation_id"],
+                "planned": "active",
+                "current": current_status,
+            }
+    return changed_wells, reservation_change
+
+
+def get_plan_row(conn: sqlite3.Connection, plan_id: int) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone()
+
+
+def find_plan_by_key(conn: sqlite3.Connection, request_key: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM plans WHERE request_key = ?", (request_key,)).fetchone()
+
+
+def confirm_plan(conn: sqlite3.Connection, plan_id: int, confirm_key: str) -> dict:
+    """在调用方写事务内重读状态并确认计划。
+
+    仅当快照中涉及孔的体积/组成/容量/隔离/生效预留以及绑定预留状态均未变化时，
+    才按原顺序原子执行（复用批次执行路径，confirm_key 作为批次 request_key）
+    并在同事务把计划标记 committed；任一变化抛 PlanStateChanged，计划保持
+    planned 可重试，confirm_key 不消耗。已 committed 的计划：同键按重放处理，
+    换键抛 PlanAlreadyCommitted——均不重复扣量。
+    """
+    row = get_plan_row(conn, plan_id)
+    if row is None:
+        raise PlanNotFound(plan_id)
+    if row["status"] == "committed":
+        if row["confirm_key"] == confirm_key:
+            return {"batch_id": row["committed_batch_id"], "replayed": True}
+        raise PlanAlreadyCommitted(plan_id, row["confirm_key"], row["committed_batch_id"])
+    other = conn.execute(
+        "SELECT id FROM plans WHERE confirm_key = ?", (confirm_key,)
+    ).fetchone()
+    if other is not None:
+        raise PlanConfirmKeyConflict(confirm_key, existing_plan_id=int(other["id"]))
+    batch_row = find_batch_by_key(conn, confirm_key)
+    if batch_row is not None:
+        raise PlanConfirmKeyConflict(confirm_key, existing_batch_id=int(batch_row["id"]))
+    changed_wells, reservation_change = _plan_state_changes(conn, row)
+    if changed_wells or reservation_change is not None:
+        raise PlanStateChanged(plan_id, changed_wells, reservation_change)
+
+    operations = [
+        SimpleNamespace(
+            source=op["source"],
+            destination=op["destination"],
+            volume=Decimal(op["volume"]),
+        )
+        for op in conn.execute(
+            "SELECT source, destination, volume FROM plan_operations "
+            "WHERE plan_id = ? ORDER BY step",
+            (plan_id,),
+        ).fetchall()
+    ]
+    batch_id = execute_batch(conn, confirm_key, operations, row["reservation_id"])
+    conn.execute(
+        "UPDATE plans SET status = 'committed', confirm_key = ?, committed_at = ?, "
+        "committed_batch_id = ? WHERE id = ?",
+        (confirm_key, _now(), batch_id, plan_id),
+    )
+    return {"batch_id": batch_id, "replayed": False}
+
+
+def plan_target(conn: sqlite3.Connection, plan_id: int) -> tuple[list, int | None]:
+    """计划目标：有序操作序列 + 绑定预留（同键换目标判定的依据）。"""
+    row = conn.execute(
+        "SELECT reservation_id FROM plans WHERE id = ?", (plan_id,)
+    ).fetchone()
+    operations = conn.execute(
+        "SELECT source, destination, volume FROM plan_operations "
+        "WHERE plan_id = ? ORDER BY step",
+        (plan_id,),
+    ).fetchall()
+    return (
+        [(op["source"], op["destination"], op["volume"]) for op in operations],
+        row["reservation_id"],
+    )
+
+
+def plan_payload(
+    conn: sqlite3.Connection, plan_id: int, replayed: bool = False
+) -> dict | None:
+    row = get_plan_row(conn, plan_id)
+    if row is None:
+        return None
+    operations = conn.execute(
+        "SELECT step, source, destination, volume FROM plan_operations "
+        "WHERE plan_id = ? ORDER BY step",
+        (plan_id,),
+    ).fetchall()
+    snapshot = _load_plan_snapshot(conn, plan_id)
+    own_items: dict[str, Decimal] = {}
+    if row["reservation_id"] is not None:
+        own_items = {
+            r["well"]: Decimal(r["volume"])
+            for r in conn.execute(
+                "SELECT well, volume FROM reservation_items WHERE reservation_id = ?",
+                (row["reservation_id"],),
+            ).fetchall()
+        }
+    held_by_others = _held_by_others(
+        snapshot, own_items, [op["source"] for op in operations]
+    )
+    sim_operations = [
+        SimpleNamespace(
+            source=op["source"],
+            destination=op["destination"],
+            volume=Decimal(op["volume"]),
+        )
+        for op in operations
+    ]
+    # 逐步校验结果由快照与操作确定性重算，与创建计划时的预演一致
+    steps, _ = _simulate_steps(snapshot, sim_operations, held_by_others)
+    sample_names = {
+        int(r["id"]): r["name"] for r in conn.execute("SELECT id, name FROM samples")
+    }
+    wells = []
+    for well, state in snapshot.items():
+        reserved_total = sum((r["volume"] for r in state["reservations"]), ZERO)
+        wells.append(
+            {
+                "well": well,
+                "exists": state["exists"],
+                "volume": _dec_or_none(state["volume"]),
+                "max_capacity": _dec_or_none(state["capacity"]),
+                "quarantine_request_id": state["quarantine_request_id"],
+                "reserved_volume": dec_str(reserved_total),
+                "reservations": [
+                    {"reservation_id": r["reservation_id"], "volume": dec_str(r["volume"])}
+                    for r in state["reservations"]
+                ],
+                "composition": [
+                    {"sample": sample_names[sample_id], "amount": dec_str(amount)}
+                    for sample_id, amount in sorted(
+                        state["composition"].items(),
+                        key=lambda item: sample_names[item[0]],
+                    )
+                ],
+            }
+        )
+    return {
+        "plan_id": row["id"],
+        "request_key": row["request_key"],
+        "status": row["status"],
+        "reservation_id": row["reservation_id"],
+        "confirm_key": row["confirm_key"],
+        "created_at": row["created_at"],
+        "committed_at": row["committed_at"],
+        "committed_batch_id": row["committed_batch_id"],
+        "replayed": replayed,
+        "operations": [dict(op) for op in operations],
+        "steps": steps,
+        "snapshot": {"wells": wells},
+        "batch": (
+            batch_payload(conn, row["committed_batch_id"])
+            if row["committed_batch_id"] is not None
+            else None
+        ),
     }

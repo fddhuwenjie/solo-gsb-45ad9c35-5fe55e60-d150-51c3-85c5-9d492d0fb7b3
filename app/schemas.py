@@ -92,6 +92,25 @@ class ReversalCreate(BaseModel):
         return value
 
 
+class PlanCreate(BatchCreate):
+    """移液计划创建：与批次相同的请求体（request_key + operations + 可选
+    reservation_id）；服务只固定快照并逐步校验，不落批次、不动液体。"""
+
+
+class PlanConfirmCreate(BaseModel):
+    """确认计划：独立 confirm_key 幂等（同键重放、同键换计划 409）。"""
+
+    confirm_key: str = Field(min_length=1, max_length=128)
+
+    @field_validator("confirm_key")
+    @classmethod
+    def _key(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("confirm_key 不能为空")
+        return value
+
+
 class CapacityUpdate(BaseModel):
     """设置或取消孔位最大容量：正数表示上限，null 表示取消（不限容量）。"""
 

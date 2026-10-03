@@ -78,6 +78,41 @@ class BatchCreate(BaseModel):
         return value
 
 
+class PlanCreate(BaseModel):
+    """先核对、后确认的移液计划：与直接提交批次同样的 operations 与预留语义。
+
+    服务在只读事务固定涉及孔规范快照并完成逐步校验后落库计划（不写批次、
+    不改变液体）；request_key 用于计划幂等去重。之后须以独立 confirm_key
+    调用确认端点，快照未变化才原子执行。
+    """
+
+    request_key: str = Field(min_length=1, max_length=128)
+    operations: list[TransferOp] = Field(min_length=1)
+    reservation_id: int | None = Field(default=None, gt=0)
+
+    @field_validator("request_key")
+    @classmethod
+    def _key(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("request_key 不能为空")
+        return value
+
+
+class PlanConfirmCreate(BaseModel):
+    """确认移液计划：独立 confirm_key 幂等去重（与计划 request_key 分离）。"""
+
+    confirm_key: str = Field(min_length=1, max_length=128)
+
+    @field_validator("confirm_key")
+    @classmethod
+    def _key(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("confirm_key 不能为空")
+        return value
+
+
 class ReversalCreate(BaseModel):
     """撤销一批已提交移液：request_key 用于撤销操作的幂等去重。"""
 

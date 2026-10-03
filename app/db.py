@@ -42,6 +42,8 @@ CREATE TABLE IF NOT EXISTS batches (
     -- 绑定的移液体积预留：仅当逐孔逐量完全兑现时批次才提交并把预留置为 consumed；
     -- NULL 表示未绑定预留的普通批次（不能动用任何被预留体积）。
     reservation_id INTEGER REFERENCES reservations(id),
+    -- 由「计划 → 确认」流程提交的批次指向其确认记录；NULL 表示直接提交的批次。
+    plan_confirmation_id INTEGER REFERENCES plan_confirmations(id),
     created_at  TEXT NOT NULL
 );
 
@@ -169,6 +171,73 @@ CREATE TABLE IF NOT EXISTS reservation_cancellations (
     request_key    TEXT NOT NULL UNIQUE,
     cancelled_at   TEXT NOT NULL
 );
+
+-- ---------------------------------------------------------------- 移液计划（先核对、后确认）
+-- 计划：调用方以 request_key 提交 operations（可选 reservation_id），服务在只读
+-- 事务固定涉及孔的体积/组成/容量/隔离/生效预留规范快照并完成逐步校验后落库；
+-- 计划不写批次、不改变液体。确认时在写事务重读状态，仅当快照各维均未变化才
+-- 原子执行并标记 committed；任一变化返回 409，计划保持 awaiting_confirmation、
+-- 可原 confirm_key 重试。
+CREATE TABLE IF NOT EXISTS transfer_plans (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_key    TEXT NOT NULL UNIQUE,
+    reservation_id INTEGER REFERENCES reservations(id),
+    -- awaiting_confirmation（已核对待确认）/ committed（已确认并原子执行）
+    status         TEXT NOT NULL CHECK (status IN ('awaiting_confirmation', 'committed')),
+    created_at     TEXT NOT NULL,
+    committed_at   TEXT
+);
+
+-- 计划的逐步操作，按 step 保存原始提交顺序（确认时严格按此顺序重放）。
+CREATE TABLE IF NOT EXISTS plan_operations (
+    plan_id     INTEGER NOT NULL REFERENCES transfer_plans(id),
+    step        INTEGER NOT NULL,
+    source      TEXT NOT NULL,
+    destination TEXT NOT NULL,
+    volume      TEXT NOT NULL,
+    PRIMARY KEY (plan_id, step)
+);
+
+-- 计划创建时（只读事务内）固定的涉及孔规范快照：孔是否存在、体积、容量上限
+-- 与隔离状态（quarantine_request_id 为 NULL 表示未隔离；已登记但被抽干的孔
+-- volume 仍为 '0'，registered=1；volume 为 NULL 表示当时尚未登记）。
+CREATE TABLE IF NOT EXISTS plan_well_snapshots (
+    plan_id              INTEGER NOT NULL REFERENCES transfer_plans(id),
+    well                 TEXT NOT NULL,
+    registered           INTEGER NOT NULL DEFAULT 1,
+    volume               TEXT,
+    max_capacity         TEXT,
+    quarantine_request_id INTEGER,
+    PRIMARY KEY (plan_id, well)
+);
+
+-- 快照孔在创建时的各初始样本量（确认时逐样本对比，识别组成变化）。
+CREATE TABLE IF NOT EXISTS plan_snapshot_composition (
+    plan_id   INTEGER NOT NULL REFERENCES transfer_plans(id),
+    well      TEXT NOT NULL,
+    sample_id INTEGER NOT NULL REFERENCES samples(id),
+    amount    TEXT NOT NULL,
+    PRIMARY KEY (plan_id, well, sample_id)
+);
+
+-- 快照创建时各孔的生效预留集合（确认时按「预留编号 -> 体积」逐孔对比，
+-- 识别预留被建立、取消、消费或改量）。
+CREATE TABLE IF NOT EXISTS plan_snapshot_reservations (
+    plan_id        INTEGER NOT NULL REFERENCES transfer_plans(id),
+    well           TEXT NOT NULL,
+    reservation_id INTEGER NOT NULL REFERENCES reservations(id),
+    volume         TEXT NOT NULL,
+    PRIMARY KEY (plan_id, well, reservation_id)
+);
+
+-- 计划确认：独立 confirm_key 幂等（重放不重复扣量）；同键换计划 409。
+CREATE TABLE IF NOT EXISTS plan_confirmations (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id     INTEGER NOT NULL UNIQUE REFERENCES transfer_plans(id),
+    confirm_key TEXT NOT NULL UNIQUE,
+    batch_id    INTEGER REFERENCES batches(id),
+    confirmed_at TEXT NOT NULL
+);
 """
 
 
@@ -201,7 +270,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
     """老库就地升级。
 
     - wells 表补 max_capacity 列：既有行 NULL（不限容量）；
-    - batches 表补 reservation_id 列：既有批次均为未绑定预留的普通批次（NULL）。
+    - batches 表补 reservation_id 列：既有批次均为未绑定预留的普通批次（NULL）；
+    - batches 表补 plan_confirmation_id 列：既有批次均为直接提交（NULL）。
     现有数据与行为完全保留。
     """
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(wells)")}
@@ -210,6 +280,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
     batch_columns = {row["name"] for row in conn.execute("PRAGMA table_info(batches)")}
     if "reservation_id" not in batch_columns:
         conn.execute("ALTER TABLE batches ADD COLUMN reservation_id INTEGER")
+    if "plan_confirmation_id" not in batch_columns:
+        conn.execute("ALTER TABLE batches ADD COLUMN plan_confirmation_id INTEGER")
 
 
 @contextmanager
@@ -217,7 +289,7 @@ def write_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     """立即写事务：BEGIN IMMEDIATE 在事务起点就取得保留锁。
 
     所有变更端点（补液、批次、撤销、容量变更、隔离申请与解除、预留建立/
-    兑现/取消）都经此进入事务，使「校验读 → 写入 →
+    兑现/取消、计划建立/确认）都经此进入事务，使「校验读 → 写入 →
     提交」全程互斥串行：后到的事务在 BEGIN IMMEDIATE 处等待，待先到者
     提交后才开始读库，必然读到已提交的新状态，不会以旧快照覆盖新写入
     （例如撤销完成阻塞检查后另一请求的补液）。等不到锁由 busy_timeout
@@ -231,3 +303,23 @@ def write_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
         raise
     else:
         conn.commit()
+
+
+@contextmanager
+def read_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """只读快照事务：整段读取同一一致性快照，不获取写锁也不改变任何状态。
+
+    移液计划创建时在此事务内固定涉及孔的规范快照并完成逐步预演；并发
+    补液/批次/容量变更/隔离/预留等写事务不会被其阻塞，其已提交结果也
+    不会在事务中途混入（WAL 下读不阻塞写、写不阻塞读）。
+    """
+    isolation = conn.isolation_level
+    conn.isolation_level = None
+    try:
+        conn.execute("BEGIN")
+        try:
+            yield conn
+        finally:
+            conn.rollback()  # 只读事务：无待提交变更，仅释放快照
+    finally:
+        conn.isolation_level = isolation

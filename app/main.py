@@ -13,6 +13,8 @@ from . import ledger
 from .schemas import (
     BatchCreate,
     CapacityUpdate,
+    PlanConfirmCreate,
+    PlanCreate,
     QuarantineCreate,
     QuarantineReleaseCreate,
     ReservationCancelCreate,
@@ -283,6 +285,330 @@ def get_batch(batch_id: int, conn: sqlite3.Connection = Depends(get_db)) -> dict
     if row is None:
         raise HTTPException(status_code=404, detail=f"批次 {batch_id} 不存在")
     return ledger.batch_payload(conn, batch_id)
+
+
+# ------------------------------------------------ 移液计划（先核对、后确认）
+
+
+def _plan_replay_or_conflict(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    payload: PlanCreate,
+    response: Response,
+) -> dict:
+    """同键同目标（逐步操作集合 + reservation_id）重放；同键换目标 409。"""
+    existing_reservation, existing_ops = ledger.plan_target(conn, int(row["id"]))
+    submitted_ops = [
+        (
+            step,
+            op.source,
+            op.destination,
+            ledger.dec_str(ledger.q(op.volume)),
+        )
+        for step, op in enumerate(payload.operations, start=1)
+    ]
+    if existing_reservation == payload.reservation_id and existing_ops == submitted_ops:
+        response.status_code = 200
+        return ledger.plan_payload(conn, int(row["id"]), replayed=True)
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "message": (
+                f"request_key {payload.request_key} 已用于另一份移液计划"
+                f"（计划 {row['id']}），不能再提交不同目标"
+            ),
+            "reason": "request_key_conflict",
+            "existing_plan_id": int(row["id"]),
+            "existing_reservation_id": existing_reservation,
+            "existing_operations": [
+                {
+                    "step": step,
+                    "source": source,
+                    "destination": destination,
+                    "volume": volume,
+                }
+                for step, source, destination, volume in existing_ops
+            ],
+        },
+    )
+
+
+def _plan_stale_detail(exc: ledger.PlanStale, **extra) -> dict:
+    """快照失效 409：逐孔列出变化维度与原因，计划保持可重试。"""
+    return {
+        "message": str(exc),
+        "reason": "plan_stale",
+        "changed_wells": exc.changed_wells,
+        **extra,
+    }
+
+
+@app.post("/plans", status_code=201)
+def create_plan(
+    payload: PlanCreate,
+    response: Response,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict:
+    """创建「先核对、后确认」的移液计划。
+
+    先在**只读事务**内固定涉及孔当前体积、组成、容量、隔离与生效预留的规范
+    快照，并返回逐步校验结果（不写批次、不改变液体）；随后在写事务重读核对
+    并落库计划。预演失败（体积不足/容量超限/隔离/预留不合法）不落任何计划、
+    不消耗 request_key。request_key 幂等：同键同目标重放首次结果（200），
+    同键换目标 409。
+    """
+    # 事务外快速路径：无并发时直接给出重放/换目标结论，免开事务。
+    existing = ledger.find_plan_by_key(conn, payload.request_key)
+    if existing is not None:
+        return _plan_replay_or_conflict(conn, existing, payload, response)
+
+    try:
+        # 只读快照事务：固定规范快照并逐步预演，不获取写锁、不改变任何状态。
+        with db_module.read_transaction(conn):
+            row = ledger.find_plan_by_key(conn, payload.request_key)
+            if row is not None:
+                return _plan_replay_or_conflict(conn, row, payload, response)
+            snapshot, steps, _own = ledger.preview_plan(
+                conn, payload.operations, payload.reservation_id
+            )
+        # 写事务落库：重读涉及孔，只读快照之后若已有任何变更即 409（不落计划）。
+        with db_module.write_transaction(conn):
+            row = ledger.find_plan_by_key(conn, payload.request_key)
+            if row is not None:
+                return _plan_replay_or_conflict(conn, row, payload, response)
+            plan_id = ledger.create_plan(
+                conn,
+                payload.request_key,
+                payload.operations,
+                payload.reservation_id,
+                snapshot,
+            )
+    except ledger.WellQuarantined as exc:
+        # 隔离冲突：不落计划、不消耗 request_key，解除隔离后同键可重试
+        raise HTTPException(status_code=409, detail=_well_quarantined_detail(exc))
+    except ledger.ReservationNotFound as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": str(exc),
+                "reason": "reservation_not_found",
+                "reservation_id": exc.reservation_id,
+            },
+        )
+    except ledger.ReservationNotActive as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": str(exc),
+                "reason": "reservation_not_active",
+                "reservation_id": exc.reservation_id,
+                "status": exc.status,
+            },
+        )
+    except ledger.ReservationFulfillmentMismatch as exc:
+        # 预演失败不落计划：不兑现、不消耗预留、不消耗 request_key
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": str(exc),
+                "reason": "reservation_fulfillment_mismatch",
+                "reservation_id": exc.reservation_id,
+                "mismatched_wells": exc.mismatches,
+            },
+        )
+    except ledger.PlanSimulationError as exc:
+        # 预演在某一步失败：返回逐步校验结果与失败步骤，不落计划、不消耗键
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": exc.message,
+                "reason": exc.kind,
+                **exc.detail,
+                "steps": exc.steps,
+            },
+        )
+    except ledger.PlanStale as exc:
+        # 只读快照之后、落锁之前涉及孔已变化：整次不落计划，键未消耗，可重试
+        raise HTTPException(status_code=409, detail=_plan_stale_detail(exc))
+    except sqlite3.IntegrityError:
+        # 兜底：并发下同键已落库，按重放/换目标处理
+        row = ledger.find_plan_by_key(conn, payload.request_key)
+        if row is not None:
+            return _plan_replay_or_conflict(conn, row, payload, response)
+        raise
+
+    response.status_code = 201
+    return ledger.plan_payload(conn, plan_id)
+
+
+@app.get("/plans")
+def list_plans(conn: sqlite3.Connection = Depends(get_db)) -> dict:
+    """全部移液计划（待确认与已提交）。"""
+    rows = conn.execute("SELECT id FROM transfer_plans ORDER BY id").fetchall()
+    return {"plans": [ledger.plan_payload(conn, row["id"]) for row in rows]}
+
+
+@app.get("/plans/{plan_id}")
+def get_plan(plan_id: int, conn: sqlite3.Connection = Depends(get_db)) -> dict:
+    """单个移液计划：操作、创建时规范快照、逐步校验结果与确认信息。"""
+    body = ledger.plan_payload(conn, plan_id)
+    if body is None:
+        raise HTTPException(status_code=404, detail=f"移液计划 {plan_id} 不存在")
+    return body
+
+
+@app.post("/plans/{plan_id}/confirmations", status_code=201)
+def confirm_plan(
+    plan_id: int,
+    payload: PlanConfirmCreate,
+    response: Response,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict:
+    """确认移液计划：在同一写事务重读状态，快照各维均未变化才按原顺序原子执行。
+
+    涉及孔的体积、组成、容量、隔离或生效预留任一变化即 409 plan_stale，
+    逐孔列出变化原因，计划保持 awaiting_confirmation、可原 confirm_key
+    重试。confirm_key 独立幂等：同键重放返回首次结果（200，不重复扣量）；
+    同键确认另一计划返回 409 request_key_conflict；已确认计划再确认
+    返回 409 already_committed（不执行、不扣量）。
+    """
+    # 事务外快速路径：confirm_key 已有结论时直接重放/判错键。
+    existing = ledger.find_confirmation_by_key(conn, payload.confirm_key)
+    if existing is not None:
+        if int(existing["plan_id"]) != plan_id:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": (
+                        f"confirm_key {payload.confirm_key} 已用于确认计划 "
+                        f"{existing['plan_id']}，不能再用于计划 {plan_id}"
+                    ),
+                    "reason": "request_key_conflict",
+                    "plan_id": plan_id,
+                    "existing_plan_id": int(existing["plan_id"]),
+                },
+            )
+        response.status_code = 200
+        return ledger.confirmation_payload(conn, int(existing["id"]), replayed=True)
+
+    try:
+        # BEGIN IMMEDIATE 立即取锁：键复核、快照一致性核对与批次执行持同一把
+        # 锁完成，与并发补液/批次/撤销/容量/隔离/预留变更串行；确认重放、错键
+        # 与已失效计划均不会重复执行、重复扣量。
+        with db_module.write_transaction(conn):
+            row = ledger.find_confirmation_by_key(conn, payload.confirm_key)
+            if row is not None:
+                if int(row["plan_id"]) != plan_id:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "message": (
+                                f"confirm_key {payload.confirm_key} 已用于确认计划 "
+                                f"{row['plan_id']}，不能再用于计划 {plan_id}"
+                            ),
+                            "reason": "request_key_conflict",
+                            "plan_id": plan_id,
+                            "existing_plan_id": int(row["plan_id"]),
+                        },
+                    )
+                response.status_code = 200
+                return ledger.confirmation_payload(conn, int(row["id"]), replayed=True)
+            confirmation_id = ledger.confirm_plan(conn, plan_id, payload.confirm_key)
+    except ledger.PlanNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ledger.PlanCommitConflict as exc:
+        detail: dict = {
+            "message": exc.message,
+            "reason": exc.reason,
+            "plan_id": exc.plan_id,
+        }
+        if exc.existing_plan_id is not None:
+            detail["existing_plan_id"] = exc.existing_plan_id
+        if exc.existing_batch_id is not None:
+            detail["existing_batch_id"] = exc.existing_batch_id
+        raise HTTPException(status_code=409, detail=detail)
+    except ledger.PlanStale as exc:
+        # 快照已失效：列出孔与变化原因；计划未提交、confirm_key 未消耗，可重试
+        raise HTTPException(
+            status_code=409, detail=_plan_stale_detail(exc, plan_id=plan_id)
+        )
+    except ledger.WellQuarantined as exc:
+        # 锁内执行时触及隔离孔（快照核对之后理论上已被 plan_stale 拦截，
+        # 此为防御性兜底）：不执行、不扣量、不消耗 confirm_key
+        raise HTTPException(
+            status_code=409, detail=_well_quarantined_detail(exc, plan_id=plan_id)
+        )
+    except ledger.ReservationNotFound as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": str(exc),
+                "reason": "reservation_not_found",
+                "reservation_id": exc.reservation_id,
+            },
+        )
+    except ledger.ReservationNotActive as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": str(exc),
+                "reason": "reservation_not_active",
+                "reservation_id": exc.reservation_id,
+                "status": exc.status,
+            },
+        )
+    except ledger.ReservationFulfillmentMismatch as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": str(exc),
+                "reason": "reservation_fulfillment_mismatch",
+                "reservation_id": exc.reservation_id,
+                "mismatched_wells": exc.mismatches,
+            },
+        )
+    except ledger.InsufficientVolume as exc:
+        # 锁内执行时体积不足（通常已被 plan_stale 拦截；防御性兜底）：
+        # 同事务回滚，未写批次/确认，confirm_key 不消耗，可核对后重试
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": str(exc),
+                "reason": "insufficient_volume",
+                "plan_id": plan_id,
+                "well": exc.well,
+                "available": ledger.dec_str(exc.available),
+                "requested": ledger.dec_str(exc.requested),
+            },
+        )
+    except ledger.CapacityExceeded as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=_capacity_exceeded_detail(exc, plan_id=plan_id),
+        )
+    except sqlite3.IntegrityError:
+        # 兜底：极端并发下 confirm_key 唯一约束拦截
+        row = ledger.find_confirmation_by_key(conn, payload.confirm_key)
+        if row is not None:
+            if int(row["plan_id"]) != plan_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": (
+                            f"confirm_key {payload.confirm_key} 已用于确认计划 "
+                            f"{row['plan_id']}，不能再用于计划 {plan_id}"
+                        ),
+                        "reason": "request_key_conflict",
+                        "plan_id": plan_id,
+                        "existing_plan_id": int(row["plan_id"]),
+                    },
+                )
+            response.status_code = 200
+            return ledger.confirmation_payload(conn, int(row["id"]), replayed=True)
+        raise
+
+    response.status_code = 201
+    return ledger.confirmation_payload(conn, confirmation_id)
 
 
 def _request_key_conflict_detail(request_key: str, batch_id: int, existing_batch_id: int) -> dict:
